@@ -25,7 +25,7 @@ def load_config() -> BotConfig:
         groq_api_key=os.environ["GROQ_API_KEY"],
         groq_chat_model=os.getenv("GROQ_CHAT_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
         groq_vision_model=os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
-        database_path=os.getenv("DATABASE_PATH", "./data/cipbot.sqlite3"),
+        database_path=os.getenv("DATABASE_PATH", "./data/cipereusz-premium.sqlite3"),
         random_reply_chance=float(os.getenv("RANDOM_REPLY_CHANCE", "0.05")),
         idle_seconds=int(os.getenv("IDLE_SECONDS", "7200")),
         memory_batch_size=int(os.getenv("MEMORY_BATCH_SIZE", "20")),

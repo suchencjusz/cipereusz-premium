@@ -60,7 +60,8 @@ class _TableParser(HTMLParser):
 
 
 def _fetch_url(url: str, timeout: int = 10) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "cipbot/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 7.1.2; TX2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.73 Safari/537.36"})
+    
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read().decode("utf-8", errors="ignore")
 

@@ -1,0 +1,10 @@
+services:
+  cipbot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Europe/Warsaw}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

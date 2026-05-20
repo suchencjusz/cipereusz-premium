@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cipereusz-premium"
+version = "0.1.0"
+description = "Next gen of cipereusz"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "aiosqlite>=0.20.0",
+  "discord.py>=2.4.0",
+  "groq>=0.9.0",
+  "python-dotenv>=1.0.1",
+  "requests>=2.31.0",
+  "tzdata>=2024.1",
+  "duckduckgo-search>=6.2.0",
+]
+
+[project.scripts]
+cipereusz-premium = "cipereusz-premium.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["cipereusz-premium*"]

@@ -8,10 +8,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
-COPY cipereusz-premium ./cipereusz-premium
+COPY cipereusz_premium ./cipereusz_premium
 
 RUN pip install --upgrade pip && pip install .
 
 VOLUME ["/app/data"]
 
-CMD ["python", "-m", "cipereusz-premium"]
+CMD ["python", "-m", "cipereusz_premium"]

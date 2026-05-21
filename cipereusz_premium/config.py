@@ -17,9 +17,14 @@ class BotConfig:
     memory_recent_messages: int
     mention_reply_limit: int
     admin_user_id: int
+    allowed_bot_id: int
+    allowed_bot_ping_chance: float
 
 
 def load_config() -> BotConfig:
+    bot_ping_chance = float(os.getenv("BOT_PING_CHANCE", "0.05"))
+    bot_ping_chance = max(0.0, min(1.0, bot_ping_chance))
+
     return BotConfig(
         discord_token=os.environ["TOKEN_DISCORD"],
         groq_api_key=os.environ["GROQ_API_KEY"],
@@ -32,4 +37,6 @@ def load_config() -> BotConfig:
         memory_recent_messages=int(os.getenv("MEMORY_RECENT_MESSAGES", "24")),
         mention_reply_limit=int(os.getenv("MENTION_REPLY_LIMIT", "220")),
         admin_user_id=int(os.getenv("ADMIN_USER_ID", "321309474667233284")),
+        allowed_bot_id=int(os.getenv("BOT_PING_ID", "1437781243751301264")),
+        allowed_bot_ping_chance=bot_ping_chance,
     )

@@ -238,6 +238,13 @@ class CipekBot(commands.Bot):
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
+            if (
+                self.config.allowed_bot_id
+                and message.author.id == self.config.allowed_bot_id
+                and self.user is not None
+                and self.user.mentioned_in(message)
+            ):
+                await self._reply_to_mention(message)
             return
 
         if message.guild is not None:
@@ -425,7 +432,9 @@ class CipekBot(commands.Bot):
             if message.channel.permissions_for(message.guild.me).send_messages:
                 if tool_context.ping_used:
                     return
+
                 safe_reply = discord.utils.escape_mentions(reply)
+                
                 await message.channel.send(safe_reply)
 
     def _record_time(self, record: MessageRecord) -> datetime | None:
@@ -436,13 +445,19 @@ class CipekBot(commands.Bot):
 
     def _recent_records(self, guild_id: int, since: datetime) -> list[MessageRecord]:
         records: list[MessageRecord] = []
+
         for record in self.recent_messages[guild_id]:
+
             if not record.content:
                 continue
+
             record_time = self._record_time(record)
+
             if record_time is None or record_time < since:
                 continue
+
             records.append(record)
+
         return records
 
     def _pick_recent_participant(self, guild_id: int, since: datetime) -> MessageRecord | None:
@@ -453,6 +468,7 @@ class CipekBot(commands.Bot):
             return None
 
         latest_by_user: dict[str, MessageRecord] = {}
+
         for record in records:
             if record.user_id == current_bot_id:
                 continue
@@ -490,6 +506,30 @@ class CipekBot(commands.Bot):
                 return None
 
         return channel
+
+    async def _maybe_ping_allowed_bot(
+        self,
+        guild: discord.Guild,
+        channel: discord.abc.Messageable | None,
+    ) -> bool:
+        bot_id = self.config.allowed_bot_id
+
+        if not bot_id:
+            return False
+        if self.config.allowed_bot_ping_chance <= 0:
+            return False
+        if random.random() >= self.config.allowed_bot_ping_chance:
+            return False
+        if guild.get_member(bot_id) is None:
+            return False
+
+        resolved_channel = self._resolve_ping_channel(guild, channel, 0)
+        if resolved_channel is None:
+            return False
+
+        await resolved_channel.send(f"<@{bot_id}>")
+
+        return True
 
     def _next_random_time(self, base: datetime) -> datetime:
         delay_seconds = random.uniform(600, 36000)
@@ -539,7 +579,9 @@ class CipekBot(commands.Bot):
                 continue
             channel = self._pick_text_channel(guild)
             try:
-                await self._run_random_ping(guild, channel)
+                pinged = await self._maybe_ping_allowed_bot(guild, channel)
+                if not pinged:
+                    await self._run_random_ping(guild, channel)
             except Exception:
                 pass
             self.next_random_ping[guild.id] = self._next_random_time(now)

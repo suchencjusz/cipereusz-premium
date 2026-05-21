@@ -19,6 +19,8 @@ Create a `.env` file from `.env.example` and fill in:
 - `MEMORY_RECENT_MESSAGES`
 - `MENTION_REPLY_LIMIT`
 - `ADMIN_USER_ID`
+- `BOT_PING_ID`
+- `BOT_PING_CHANCE`
 - `TZ`
 
 ## Docker

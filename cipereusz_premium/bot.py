@@ -49,6 +49,7 @@ def _is_image_attachment(attachment: discord.Attachment) -> bool:
 @dataclass(slots=True)
 class MessageRecord:
     message_id: int
+    channel_id: int
     user_id: str
     username: str
     content: str
@@ -197,13 +198,11 @@ class CipekBot(commands.Bot):
             description="ping the current target user in the current channel",
             parameters={
                 "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "short text after the ping"}
-                },
+                "properties": {},
                 "additionalProperties": False,
             },
         )
-        async def ping_target(args: dict[str, str]) -> str:
+        async def ping_target(_args: dict[str, str]) -> str:
             context = self._tool_context
 
             if context is None:
@@ -213,11 +212,9 @@ class CipekBot(commands.Bot):
             channel = self.get_channel(context.channel_id)
             if channel is None:
                 return "no_channel"
-            text = str(args.get("text", "")).strip()
-            suffix = f" {text}" if text else ""
             context.ping_used = True
 
-            await channel.send(f"<@{context.target_user_id}>{suffix}")
+            await channel.send(f"<@{context.target_user_id}>")
             
             return "ok"
 
@@ -250,6 +247,7 @@ class CipekBot(commands.Bot):
             self.recent_messages[guild_id].append(
                 MessageRecord(
                     message_id=message.id,
+                    channel_id=message.channel.id,
                     user_id=str(message.author.id),
                     username=message.author.display_name,
                     content=(message.content or "").strip(),
@@ -430,6 +428,69 @@ class CipekBot(commands.Bot):
                 safe_reply = discord.utils.escape_mentions(reply)
                 await message.channel.send(safe_reply)
 
+    def _record_time(self, record: MessageRecord) -> datetime | None:
+        try:
+            return datetime.fromisoformat(record.created_at)
+        except ValueError:
+            return None
+
+    def _recent_records(self, guild_id: int, since: datetime) -> list[MessageRecord]:
+        records: list[MessageRecord] = []
+        for record in self.recent_messages[guild_id]:
+            if not record.content:
+                continue
+            record_time = self._record_time(record)
+            if record_time is None or record_time < since:
+                continue
+            records.append(record)
+        return records
+
+    def _pick_recent_participant(self, guild_id: int, since: datetime) -> MessageRecord | None:
+        current_bot_id = str(self.user.id) if self.user else ""
+        records = self._recent_records(guild_id, since)
+
+        if not records:
+            return None
+
+        latest_by_user: dict[str, MessageRecord] = {}
+        for record in records:
+            if record.user_id == current_bot_id:
+                continue
+            existing = latest_by_user.get(record.user_id)
+            if existing is None:
+                latest_by_user[record.user_id] = record
+                continue
+            existing_time = self._record_time(existing)
+            record_time = self._record_time(record)
+            if record_time is not None and existing_time is not None and record_time > existing_time:
+                latest_by_user[record.user_id] = record
+
+        if not latest_by_user:
+            return None
+
+        return random.choice(list(latest_by_user.values()))
+
+    def _resolve_ping_channel(
+        self,
+        guild: discord.Guild,
+        fallback: discord.abc.Messageable | None,
+        preferred_channel_id: int,
+    ) -> discord.abc.Messageable | None:
+        channel = self.get_channel(preferred_channel_id) if preferred_channel_id else None
+
+        if channel is None:
+            channel = fallback
+
+        if channel is None:
+            return None
+
+        me = guild.me
+        if me is not None and hasattr(channel, "permissions_for"):
+            if not channel.permissions_for(me).send_messages:
+                return None
+
+        return channel
+
     def _next_random_time(self, base: datetime) -> datetime:
         delay_seconds = random.uniform(600, 36000)
         candidate = base + timedelta(seconds=delay_seconds)
@@ -448,56 +509,20 @@ class CipekBot(commands.Bot):
         return start.replace(hour=12) + timedelta(seconds=delay_seconds % 36000)
 
     async def _run_random_ping(self, guild: discord.Guild | None, channel: discord.abc.Messageable | None) -> None:
-        if guild is None or channel is None:
+        if guild is None:
             return
-    
-        target = self._pick_active_participant(guild.id)
-        if target is None:
+
+        now = _now()
+        recent_window = timedelta(minutes=30)
+        target_record = self._pick_recent_participant(guild.id, now - recent_window)
+        if target_record is None:
             return
-    
-        if isinstance(channel, discord.abc.GuildChannel):
-            channel_id = channel.id
-        else:
-            channel_id = getattr(channel, "id", 0)
-    
-        tool_context: ToolContext | None = None
-    
-        if channel_id:
-            tool_context = ToolContext(
-                guild_id=guild.id,
-                channel_id=channel_id,
-                target_user_id=int(target[0]),
-            )
-            self._tool_context = tool_context
-        
-        try:
-            memory_context = await self._build_user_memory_context(target[0], target[1])
-            recent_context = self._recent_context(guild.id)
-            system_prompt = self.llm.build_system_prompt(
-                memory_context=(
-                    f"{memory_context}\n\n"
-                    f"ostatni kanal:\n{recent_context}"
-                    if recent_context
-                    else memory_context
-                )
-            )
-            reply = await self.llm.generate_reply(
-                model=self.config.groq_chat_model,
-                system_prompt=system_prompt,
-                user_prompt=f"zaczep uzytkownika @{target[1]} i napisz bardzo krotki zlosliwy ping",
-                temperature=1.0,
-                max_tokens=28,
-                enable_tools=False,
-            )
-        finally:
-            self._tool_context = None
-     
-        if tool_context is not None and tool_context.ping_used:
+
+        resolved_channel = self._resolve_ping_channel(guild, channel, target_record.channel_id)
+        if resolved_channel is None:
             return
-     
-        safe_reply = discord.utils.escape_mentions(reply)
-     
-        await channel.send(f"<@{target[0]}> {safe_reply}")
+
+        await resolved_channel.send(f"<@{target_record.user_id}>")
 
     @tasks.loop(seconds=60)
     async def random_ping_watchdog(self) -> None:

@@ -1,5 +1,5 @@
 services:
-  cipbot:
+  cipereusz-premium:
     build: .
     env_file:
       - .env

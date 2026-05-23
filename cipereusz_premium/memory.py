@@ -94,7 +94,7 @@ class MemoryStore:
             return None
 
         async with self._connection.execute(
-            "SELECT memory_text FROM user_dirt WHERE user_id = ? ORDER BY RANDOM() LIMIT 2",
+            "SELECT memory_text FROM user_dirt WHERE user_id = ? ORDER BY RANDOM() LIMIT 3",
             (user_id,),
         ) as cursor:
             dirt_rows = await cursor.fetchall()
@@ -130,3 +130,48 @@ class MemoryStore:
             row = await cursor.fetchone()
 
         return int(row["total"]) if row is not None else 0
+
+    async def health_check(self) -> dict[str, bool | str]:
+        assert self._connection is not None
+
+        now = datetime.now(timezone.utc).isoformat()
+        token = f"healthcheck:{now}"
+        profile_ok = False
+        dirt_ok = False
+        savepoint_created = False
+
+        try:
+            await self._connection.execute("SAVEPOINT healthcheck")
+            savepoint_created = True
+
+            await self._connection.execute(
+                "INSERT INTO user_profiles (user_id, discord_name, general_vibe) VALUES (?, ?, ?)",
+                (token, "healthcheck", "ok"),
+            )
+            await self._connection.execute(
+                "INSERT INTO user_dirt (user_id, date, memory_text) VALUES (?, ?, ?)",
+                (token, now, "healthcheck"),
+            )
+
+            async with self._connection.execute(
+                "SELECT user_id FROM user_profiles WHERE user_id = ?",
+                (token,),
+            ) as cursor:
+                profile_ok = await cursor.fetchone() is not None
+
+            async with self._connection.execute(
+                "SELECT memory_text FROM user_dirt WHERE user_id = ?",
+                (token,),
+            ) as cursor:
+                dirt_ok = await cursor.fetchone() is not None
+        except Exception as exc:
+            return {"ok": False, "error": type(exc).__name__}
+        finally:
+            if savepoint_created:
+                try:
+                    await self._connection.execute("ROLLBACK TO healthcheck")
+                    await self._connection.execute("RELEASE healthcheck")
+                except Exception:
+                    pass
+
+        return {"ok": profile_ok and dirt_ok, "profile_ok": profile_ok, "dirt_ok": dirt_ok}

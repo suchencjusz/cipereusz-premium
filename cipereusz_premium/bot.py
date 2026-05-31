@@ -693,21 +693,28 @@ class CipekBot(commands.Bot):
         return True
 
     def _next_random_time(self, base: datetime) -> datetime:
-        delay_seconds = random.uniform(600, 36000)
+        min_seconds = self.config.random_ping_min_seconds
+        max_seconds = self.config.random_ping_max_seconds
+        start_hour = self.config.random_ping_start_hour
+        end_hour = self.config.random_ping_end_hour
+
+        delay_seconds = random.uniform(min_seconds, max_seconds)
         candidate = base + timedelta(seconds=delay_seconds)
-       
-        if 12 <= candidate.hour <= 23:
+
+        if start_hour <= candidate.hour <= end_hour:
             return candidate
-       
+
         next_day = candidate.date()
-       
-        if candidate.hour > 23:
+
+        if candidate.hour > end_hour:
             next_day = (candidate + timedelta(days=1)).date()
-       
+
         base_tz = base.tzinfo or timezone.utc
         start = datetime.combine(next_day, datetime.min.time(), tzinfo=base_tz)
-       
-        return start.replace(hour=12) + timedelta(seconds=delay_seconds % 36000)
+        window_start = start.replace(hour=start_hour)
+        window_length_seconds = max(3600, (end_hour - start_hour + 1) * 3600)
+
+        return window_start + timedelta(seconds=delay_seconds % window_length_seconds)
 
     async def _run_random_ping(self, guild: discord.Guild | None, channel: discord.abc.Messageable | None) -> None:
         if guild is None:
@@ -737,8 +744,13 @@ class CipekBot(commands.Bot):
     @tasks.loop(seconds=60)
     async def random_ping_watchdog(self) -> None:
         now = _now_local()
-       
-        if not (12 <= now.hour <= 23):
+
+        if not self.config.random_ping_enabled:
+            return
+
+        start_hour = self.config.random_ping_start_hour
+        end_hour = self.config.random_ping_end_hour
+        if not (start_hour <= now.hour <= end_hour):
             return
        
         for guild in self.guilds:

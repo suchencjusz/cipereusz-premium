@@ -21,6 +21,11 @@ Create a `.env` file from `.env.example` and fill in:
 - `ADMIN_USER_ID`
 - `BOT_PING_ID`
 - `BOT_PING_CHANCE`
+- `RANDOM_PING_ENABLED`
+- `RANDOM_PING_MIN_SECONDS`
+- `RANDOM_PING_MAX_SECONDS`
+- `RANDOM_PING_START_HOUR`
+- `RANDOM_PING_END_HOUR`
 - `TZ`
 
 ## Docker

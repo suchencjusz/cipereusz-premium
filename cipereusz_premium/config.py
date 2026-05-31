@@ -4,6 +4,13 @@ import os
 from dataclasses import dataclass
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass(slots=True)
 class BotConfig:
     discord_token: str
@@ -19,6 +26,11 @@ class BotConfig:
     admin_user_id: int
     allowed_bot_id: int
     allowed_bot_ping_chance: float
+    random_ping_enabled: bool
+    random_ping_min_seconds: int
+    random_ping_max_seconds: int
+    random_ping_start_hour: int
+    random_ping_end_hour: int
     image_reply_chance: float
     random_image_chance: float
     recent_images_max: int
@@ -28,6 +40,21 @@ class BotConfig:
 def load_config() -> BotConfig:
     bot_ping_chance = float(os.getenv("BOT_PING_CHANCE", "0.05"))
     bot_ping_chance = max(0.0, min(1.0, bot_ping_chance))
+
+    random_ping_enabled = _env_bool("RANDOM_PING_ENABLED", True)
+    random_ping_min_seconds = int(os.getenv("RANDOM_PING_MIN_SECONDS", "600"))
+    random_ping_max_seconds = int(os.getenv("RANDOM_PING_MAX_SECONDS", "36000"))
+    random_ping_min_seconds = max(60, random_ping_min_seconds)
+    random_ping_max_seconds = max(random_ping_min_seconds, random_ping_max_seconds)
+    random_ping_start_hour = int(os.getenv("RANDOM_PING_START_HOUR", "12"))
+    random_ping_end_hour = int(os.getenv("RANDOM_PING_END_HOUR", "23"))
+    random_ping_start_hour = max(0, min(23, random_ping_start_hour))
+    random_ping_end_hour = max(0, min(23, random_ping_end_hour))
+    if random_ping_end_hour < random_ping_start_hour:
+        random_ping_start_hour, random_ping_end_hour = (
+            random_ping_end_hour,
+            random_ping_start_hour,
+        )
 
     image_reply_chance = float(os.getenv("IMAGE_REPLY_CHANCE", "0.15"))
     image_reply_chance = max(0.0, min(1.0, image_reply_chance))
@@ -52,6 +79,11 @@ def load_config() -> BotConfig:
         admin_user_id=int(os.getenv("ADMIN_USER_ID", "321309474667233284")),
         allowed_bot_id=int(os.getenv("BOT_PING_ID", "1437781243751301264")),
         allowed_bot_ping_chance=bot_ping_chance,
+        random_ping_enabled=random_ping_enabled,
+        random_ping_min_seconds=random_ping_min_seconds,
+        random_ping_max_seconds=random_ping_max_seconds,
+        random_ping_start_hour=random_ping_start_hour,
+        random_ping_end_hour=random_ping_end_hour,
         image_reply_chance=image_reply_chance,
         random_image_chance=random_image_chance,
         recent_images_max=recent_images_max,

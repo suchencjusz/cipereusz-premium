@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -55,8 +58,56 @@ class MemoryStore:
             await self._connection.close()
             self._connection = None
 
+    @property
+    def is_open(self) -> bool:
+        return self._connection is not None
+
+    async def export_to(self, dest_path: str) -> None:
+        """Robi bezpieczna, spojna kopie bazy do dest_path.
+
+        Baza dziala w trybie WAL i jest caly czas aktywna, wiec zwykle
+        skopiowanie pliku .sqlite3 mogloby pominac dane wciaz siedzace w
+        pliku -wal albo zlapac baze w trakcie zapisu. Uzywamy do tego API
+        backup() z sqlite3 (przez aiosqlite), ktore robi to poprawnie.
+        """
+        assert self._connection is not None
+
+        path = Path(dest_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.unlink()
+
+        dest = await aiosqlite.connect(dest_path)
+        try:
+            await self._connection.backup(dest)
+        finally:
+            await dest.close()
+
     async def upsert_profile(self, user_id: str, discord_name: str, general_vibe: str) -> None:
         assert self._connection is not None
+
+        general_vibe = general_vibe.strip()
+
+        # KLUCZOWA POPRAWKA: wczesniej kazda nowa ekstrakcja pamieci nadpisywala
+        # general_vibe w calosci, wiec bot efektywnie "zapominal" wszystko co
+        # wiedzial o kims, jak tylko ktos wpadl w kolejna partie do analizy.
+        # Teraz doklejamy nowa informacje do starej (z limitem dlugosci), zamiast
+        # ja kasowac.
+        async with self._connection.execute(
+            "SELECT general_vibe FROM user_profiles WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            existing = await cursor.fetchone()
+
+        if existing is not None:
+            old_vibe = str(existing["general_vibe"] or "").strip()
+            if not general_vibe:
+                general_vibe = old_vibe
+            elif old_vibe and old_vibe.lower() not in general_vibe.lower():
+                merged = f"{old_vibe} | {general_vibe}"
+                # ograniczamy dlugosc zeby nie rosla w nieskonczonosc, zachowujac
+                # najnowsze (najciekawsze) informacje
+                general_vibe = merged[-600:]
 
         await self._connection.execute(
             """
@@ -70,6 +121,7 @@ class MemoryStore:
         )
 
         await self._connection.commit()
+        log.debug("teczka: zaktualizowano profil user_id=%s dlugosc_vibe=%d", user_id, len(general_vibe))
 
     async def add_dirt(self, user_id: str, memory_text: str) -> None:
         assert self._connection is not None
@@ -80,6 +132,7 @@ class MemoryStore:
         )
 
         await self._connection.commit()
+        log.debug("teczka: dodano brud user_id=%s tresc=%r", user_id, memory_text[:80])
 
     async def get_user_memory(self, user_id: str) -> UserMemory | None:
         assert self._connection is not None

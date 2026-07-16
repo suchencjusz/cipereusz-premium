@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import html
 import inspect
+import json
+import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -13,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
+log = logging.getLogger(__name__)
 
 ToolCallable = Callable[[dict[str, Any]], Any | Awaitable[Any]]
 
@@ -120,16 +124,26 @@ class ToolRegistry:
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
         handler = self._tools.get(name)
         if handler is None:
+            log.warning("wywolano nieznane narzedzie: %s args=%s", name, arguments)
             return "unknown_tool"
+
+        log.info("tool_call name=%s args=%s", name, arguments)
+        started = time.monotonic()
+
         try:
             result = handler(arguments)
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
+            elapsed = time.monotonic() - started
+            log.exception("blad narzedzia %s (czas=%.3fs)", name, elapsed)
             return f"tool_error:{type(exc).__name__}"
-        if isinstance(result, str):
-            return result
-        return str(result)
+
+        elapsed = time.monotonic() - started
+        text_result = result if isinstance(result, str) else str(result)
+        log.info("tool_result name=%s czas=%.3fs wynik=%r", name, elapsed, text_result[:200])
+
+        return text_result
 
 
 def create_default_tools() -> ToolRegistry:
@@ -220,6 +234,64 @@ def create_default_tools() -> ToolRegistry:
         text = " | ".join(lines)
         
         return text[:1200]
+
+    @registry.register(
+        name="wikipedia_lookup",
+        description=(
+            "pobiera krotkie, rzetelne streszczenie hasla z Wikipedii (kim/czym jest X, definicje, "
+            "biografie, pojecia). UZYJ TEGO zamiast zgadywac gdy ktos pyta kim/czym jest ktos/cos, "
+            "a search_web daje za malo konkretow"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "haslo/temat do wyszukania, np. 'Kraków' albo 'fotosynteza'"},
+                "lang": {
+                    "type": "string",
+                    "description": "kod jezyka wikipedii, domyslnie pl",
+                    "enum": ["pl", "en"],
+                },
+            },
+            "required": ["topic"],
+            "additionalProperties": False,
+        },
+    )
+    async def wikipedia_lookup(args: dict[str, Any]) -> str:
+        topic = str(args.get("topic", "")).strip()
+        if not topic:
+            return "brak tematu"
+
+        lang = str(args.get("lang", "pl")).strip() or "pl"
+        if lang not in ("pl", "en"):
+            lang = "pl"
+
+        def _do_lookup() -> str:
+            search_url = (
+                f"https://{lang}.wikipedia.org/w/api.php?action=opensearch&format=json"
+                f"&limit=1&namespace=0&search={urllib.parse.quote(topic)}"
+            )
+            raw = _fetch_url(search_url, timeout=8)
+            data = json.loads(raw)
+            titles = data[1] if isinstance(data, list) and len(data) > 1 else []
+            if not titles:
+                return ""
+            title = titles[0]
+
+            summary_url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
+            raw_summary = _fetch_url(summary_url, timeout=8)
+            summary_data = json.loads(raw_summary)
+            extract = str(summary_data.get("extract", "")).strip()
+            return extract
+
+        try:
+            extract = await asyncio.to_thread(_do_lookup)
+        except Exception:
+            return "blad wikipedii"
+
+        if not extract:
+            return "nic nie znalazlem na wikipedii"
+
+        return extract[:1200]
 
     @registry.register(
         name="get_weather",
@@ -392,5 +464,114 @@ def create_default_tools() -> ToolRegistry:
             return "blad pobierania"
 
         return "nieznany scope"
+
+    @registry.register(
+        name="filmweb_ostatnie_filmy",
+        description=(
+            "UZYJ TEGO gdy ktos poda swoj nick/login z filmweb.pl (portal o filmach) albo pyta co "
+            "ostatnio ogladal/ocenial - dzieki temu mozesz go wyzwac za ocene albo gust filmowy. "
+            "Zwraca liste ostatnio ocenionych filmow z ocenami z 10."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "username": {"type": "string", "description": "login/nick uzytkownika na filmweb.pl"},
+                "limit": {
+                    "type": "integer",
+                    "description": "ile ostatnich pozycji pokazac (1-10, domyslnie 5)",
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+            },
+            "required": ["username"],
+            "additionalProperties": False,
+        },
+    )
+    async def filmweb_ostatnie_filmy(args: dict[str, Any]) -> str:
+        username = str(args.get("username", "")).strip()
+        if not username:
+            return "brak nicku"
+
+        try:
+            limit = int(args.get("limit", 5) or 5)
+        except (TypeError, ValueError):
+            limit = 5
+        limit = max(1, min(10, limit))
+
+        def _do_lookup() -> str:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 7.1.2; TX2) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/77.0.3865.73 Safari/537.36"
+                )
+            }
+
+            def _get_json(url: str, timeout: int = 8) -> Any:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+            id_url = f"https://www.filmweb.pl/api/v1/users/{urllib.parse.quote(username)}/id"
+            try:
+                id_data = _get_json(id_url)
+            except Exception:
+                return "nie znalazlem takiego uzytkownika na filmweb (zly nick albo prywatny profil)"
+
+            user_id = id_data.get("userId") if isinstance(id_data, dict) else None
+            if user_id is None:
+                return "nie znalazlem takiego uzytkownika na filmweb"
+
+            votes_url = f"https://www.filmweb.pl/api/v1/users/{user_id}/votes/film"
+            try:
+                votes_data = _get_json(votes_url)
+            except Exception:
+                return "profil prywatny albo brak ocenionych filmow"
+
+            if isinstance(votes_data, list):
+                votes = votes_data
+            elif isinstance(votes_data, dict):
+                votes = votes_data.get("votes", [])
+            else:
+                votes = []
+
+            if not votes:
+                return f"{username} nic jeszcze nie ocenil na filmweb"
+
+            def _vote_movie_id(vote: Any) -> Any:
+                entry = vote.get("id") if isinstance(vote, dict) else None
+                if isinstance(entry, dict):
+                    return entry.get("id")
+                return entry
+
+            entries: list[str] = []
+            # bierzemy zapas, bo pojedyncze zapytania o tytul moga sie nie udac
+            for vote in votes[: limit * 2]:
+                if len(entries) >= limit:
+                    break
+                movie_id = _vote_movie_id(vote)
+                if movie_id is None:
+                    continue
+                rate = vote.get("rate") if isinstance(vote, dict) else None
+
+                title = None
+                try:
+                    info_data = _get_json(f"https://www.filmweb.pl/api/v1/title/{movie_id}/info", timeout=6)
+                    if isinstance(info_data, dict):
+                        title = info_data.get("title") or info_data.get("originalTitle") or info_data.get("name")
+                except Exception:
+                    title = None
+
+                label = str(title) if title else f"film o id {movie_id}"
+                entries.append(f"{label} ({rate}/10)" if rate else label)
+
+            if not entries:
+                return "nie udalo sie pobrac szczegolow ocenionych filmow"
+
+            return f"ostatnio na filmweb ({username}): " + " | ".join(entries)
+
+        try:
+            return await asyncio.to_thread(_do_lookup)
+        except Exception:
+            return "blad polaczenia z filmweb"
 
     return registry

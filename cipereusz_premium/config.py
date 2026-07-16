@@ -35,6 +35,16 @@ class BotConfig:
     random_image_chance: float
     recent_images_max: int
     max_image_bytes: int
+    voice_enabled: bool
+    voice_admin_only: bool
+    groq_stt_model: str
+    voice_stt_language: str
+    voice_trigger_words: list[str]
+    voice_tts_voice: str
+    voice_tts_rate: str
+    memory_pending_cap: int
+    log_level: str
+    log_file: str
 
 
 def load_config() -> BotConfig:
@@ -65,6 +75,26 @@ def load_config() -> BotConfig:
     max_image_bytes = int(os.getenv("MAX_IMAGE_BYTES", "6291456"))
     max_image_bytes = max(1048576, min(15728640, max_image_bytes))
 
+    voice_enabled = _env_bool("VOICE_ENABLED", True)
+    voice_admin_only = _env_bool("VOICE_ADMIN_ONLY", False)
+    groq_stt_model = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+    voice_stt_language = os.getenv("VOICE_STT_LANGUAGE", "pl")
+    voice_trigger_words = [
+        word.strip()
+        for word in os.getenv("VOICE_TRIGGER_WORDS", "cipek,cipereusz").split(",")
+        if word.strip()
+    ]
+    # uwaga: Groq (playai-tts) obsluguje tylko angielski i arabski, wiec do polskiej
+    # mowy uzywamy edge-tts (bezplatny silnik Microsoftu, glosy pl-PL-*)
+    voice_tts_voice = os.getenv("VOICE_TTS_VOICE", "pl-PL-MarekNeural")
+    voice_tts_rate = os.getenv("VOICE_TTS_RATE", "+0%")
+
+    memory_pending_cap = int(os.getenv("MEMORY_PENDING_CAP", "300"))
+    memory_pending_cap = max(40, memory_pending_cap)
+
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    log_file = os.getenv("LOG_FILE", "./logs/cipereusz.log")
+
     return BotConfig(
         discord_token=os.environ["TOKEN_DISCORD"],
         groq_api_key=os.environ["GROQ_API_KEY"],
@@ -88,4 +118,14 @@ def load_config() -> BotConfig:
         random_image_chance=random_image_chance,
         recent_images_max=recent_images_max,
         max_image_bytes=max_image_bytes,
+        voice_enabled=voice_enabled,
+        voice_admin_only=voice_admin_only,
+        groq_stt_model=groq_stt_model,
+        voice_stt_language=voice_stt_language,
+        voice_trigger_words=voice_trigger_words,
+        voice_tts_voice=voice_tts_voice,
+        voice_tts_rate=voice_tts_rate,
+        memory_pending_cap=memory_pending_cap,
+        log_level=log_level,
+        log_file=log_file,
     )

@@ -1,26 +1,36 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import random
 import re
+import shutil
+import tempfile
+import time
 import urllib.parse
 import urllib.request
+import zipfile
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any
 
 import discord
-from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import bridge, commands, tasks
 from dotenv import load_dotenv
 
 from .config import BotConfig, load_config
 from .llm import GroqService
+from .logging_setup import setup_logging
 from .memory import MemoryStore
 from .tools import create_default_tools
+from .voice import VOICE_STACK_AVAILABLE, VoiceSession, contains_trigger
+
+log = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
@@ -38,6 +48,29 @@ def _get_local_tz() -> ZoneInfo:
 
 def _now_local() -> datetime:
     return datetime.now(_get_local_tz())
+
+
+def _truncate_reply(text: str, limit: int) -> str:
+    """Ucina tekst do limit znakow, ale na granicy slowa (spacji) zamiast w
+    polowie wyrazu - poprzednio safe_reply[:limit] potrafilo urwac slowo w
+    polowie, i co gorsza glos mowil caly nieucinany tekst podczas gdy na
+    czacie leciala urwana wersja (dwie rozne dlugosci tej samej odpowiedzi).
+    Teraz to jest jedyne miejsce ucinania - i tekst, i glos uzywaja wyniku
+    tej funkcji, wiec zawsze sie zgadzaja.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+
+    truncated = text[:limit]
+    last_space = truncated.rfind(" ")
+    # tnij na spacji tylko jesli nie ucina to za duzo (np. gdy spacja jest
+    # blisko konca limitu) - inaczej lepiej twarde ciecie niz urwanie 30%+
+    # tekstu
+    if last_space > limit * 0.6:
+        truncated = truncated[:last_space]
+
+    return truncated.strip()
 
 
 def _is_image_attachment(attachment: discord.Attachment) -> bool:
@@ -75,7 +108,7 @@ class ToolContext:
     image_used: bool = False
 
 
-class CipekBot(commands.Bot):
+class CipekBot(bridge.Bot):
     def __init__(self, config: BotConfig) -> None:
         intents = discord.Intents.default()
         intents.guilds = True
@@ -91,10 +124,16 @@ class CipekBot(commands.Bot):
             chat_model=config.groq_chat_model,
             vision_model=config.groq_vision_model,
             tools=self.tools,
+            stt_model=config.groq_stt_model,
         )
         self.recent_messages: dict[int, deque[MessageRecord]] = defaultdict(
             lambda: deque(maxlen=self.config.memory_recent_messages)
         )
+        # kolejka wiadomosci oczekujacych na ekstrakcje do teczki - NIE jest
+        # ograniczona tak ciasno jak recent_messages (ktore sluzy tylko do
+        # budowania krotkiego kontekstu odpowiedzi), zeby nic nie wypadalo
+        # z pamieci zanim zdazy zostac przetworzone
+        self.pending_memory: dict[int, list[MessageRecord]] = defaultdict(list)
         self.recent_participants: dict[int, deque[tuple[str, str]]] = defaultdict(lambda: deque(maxlen=64))
         self.recent_images: dict[int, deque[str]] = defaultdict(
             lambda: deque(maxlen=self.config.recent_images_max)
@@ -103,29 +142,27 @@ class CipekBot(commands.Bot):
         self.last_proactive: dict[int, datetime] = {}
         self.message_counter: dict[int, int] = defaultdict(int)
         self.next_random_ping: dict[int, datetime] = {}
-        self.last_summarized_id: dict[int, int] = defaultdict(int)
         self._summarize_inflight: set[int] = set()
         self._tool_context: ToolContext | None = None
         self._kranus_cache: list[str] = []
         self._kranus_cache_time: datetime | None = None
+        self.voice_sessions: dict[int, VoiceSession] = {}
+        self._initialized = False
         self._register_commands()
         self._register_tools()
 
     def _register_commands(self) -> None:
-        @self.hybrid_command(name="pomoc", aliases=["komendy", "help"], with_app_command=True)
-        async def pomoc(ctx: commands.Context) -> None:
+        @self.bridge_command(name="pomoc", aliases=["komendy", "help"])
+        async def pomoc(ctx: bridge.BridgeContext) -> None:
             embed = discord.Embed(title="komendy", color=discord.Color.dark_teal())
-            embed.add_field(name="info", value="/pomoc /teczka /api /dbtest /uczsie", inline=False)
+            embed.add_field(name="info", value="/pomoc /teczka /api /dbtest /uczsie /dolacz /wyjdz /eksport", inline=False)
             embed.set_footer(text="dziala tez z prefiksem !")
-            await ctx.send(embed=embed)
+            await ctx.respond(embed=embed)
 
-        @self.hybrid_command(name="teczka", aliases=["db", "baza"], with_app_command=True)
-        async def teczka(ctx: commands.Context) -> None:
+        @self.bridge_command(name="teczka", aliases=["db", "baza"])
+        async def teczka(ctx: bridge.BridgeContext) -> None:
             if ctx.author.id != self.config.admin_user_id:
-                if ctx.interaction:
-                    await ctx.send("nie dla ciebie", ephemeral=True)
-                else:
-                    await ctx.send("nie dla ciebie")
+                await ctx.respond("nie dla ciebie", ephemeral=True)
                 return
             stats = await self.memory.get_stats()
             user_dirt = await self.memory.get_user_dirt_count(str(ctx.author.id))
@@ -133,18 +170,14 @@ class CipekBot(commands.Bot):
             embed.add_field(name="profile", value=str(stats["profiles"],), inline=True)
             embed.add_field(name="brudy", value=str(stats["dirt"],), inline=True)
             embed.add_field(name="twoje", value=str(user_dirt), inline=True)
-            await ctx.send(embed=embed)
+            await ctx.respond(embed=embed)
 
-        @self.hybrid_command(name="dbtest", aliases=["bazatest", "testdb"], with_app_command=True)
-        async def dbtest(ctx: commands.Context) -> None:
+        @self.bridge_command(name="dbtest", aliases=["bazatest", "testdb"])
+        async def dbtest(ctx: bridge.BridgeContext) -> None:
             if ctx.author.id != self.config.admin_user_id:
-                if ctx.interaction:
-                    await ctx.send("nie dla ciebie", ephemeral=True)
-                else:
-                    await ctx.send("nie dla ciebie")
+                await ctx.respond("nie dla ciebie", ephemeral=True)
                 return
-            if ctx.interaction:
-                await ctx.defer(ephemeral=True)
+            await ctx.defer(ephemeral=True)
             result = await self.memory.health_check()
             if result.get("ok"):
                 message = (
@@ -152,27 +185,17 @@ class CipekBot(commands.Bot):
                 )
             else:
                 message = f"db fail {result.get('error', 'unknown')}"
-            if ctx.interaction:
-                await ctx.send(message, ephemeral=True)
-            else:
-                await ctx.send(message)
+            await ctx.respond(message, ephemeral=True)
 
-        @self.hybrid_command(name="uczsie", aliases=["learn", "historia"], with_app_command=True)
-        async def uczsie(ctx: commands.Context) -> None:
+        @self.bridge_command(name="uczsie", aliases=["learn", "historia"])
+        async def uczsie(ctx: bridge.BridgeContext) -> None:
             if ctx.author.id != self.config.admin_user_id:
-                if ctx.interaction:
-                    await ctx.send("nie dla ciebie", ephemeral=True)
-                else:
-                    await ctx.send("nie dla ciebie")
+                await ctx.respond("nie dla ciebie", ephemeral=True)
                 return
             if ctx.guild is None:
-                if ctx.interaction:
-                    await ctx.send("brak gildii", ephemeral=True)
-                else:
-                    await ctx.send("brak gildii")
+                await ctx.respond("brak gildii", ephemeral=True)
                 return
-            if ctx.interaction:
-                await ctx.defer(ephemeral=True)
+            await ctx.defer(ephemeral=True)
 
             result = await self._learn_from_channel_history(ctx.channel, limit=1000)
             if result.get("status") == "busy":
@@ -189,42 +212,76 @@ class CipekBot(commands.Bot):
                     f"fail={result.get('failures')}"
                 )
 
-            if ctx.interaction:
-                await ctx.send(message, ephemeral=True)
-            else:
-                await ctx.send(message)
+            await ctx.respond(message, ephemeral=True)
 
-        # @self.hybrid_command(name="pamiec", aliases=["zapamietaj", "summary"], with_app_command=True)
-        # async def pamiec(ctx: commands.Context) -> None:
-        #     if ctx.author.id != self.config.admin_user_id:
-        #         if ctx.interaction:
-        #             await ctx.send("nie dla ciebie", ephemeral=True)
-        #         else:
-        #             await ctx.send("nie dla ciebie")
-        #         return
-        #     if ctx.guild is None:
-        #         if ctx.interaction:
-        #             await ctx.send("brak gildii", ephemeral=True)
-        #         else:
-        #             await ctx.send("brak gildii")
-        #         return
+        @self.bridge_command(name="dolacz", aliases=["join", "wejdz"])
+        async def dolacz(ctx: bridge.BridgeContext) -> None:
+            if not self.config.voice_enabled:
+                await ctx.respond("funkcja glosu jest wylaczona")
+                return
+            if not VOICE_STACK_AVAILABLE:
+                await ctx.respond("brakuje na serwerze bibliotek do glosu (py-cord[voice] / edge-tts)")
+                return
+            if self.config.voice_admin_only and ctx.author.id != self.config.admin_user_id:
+                await ctx.respond("nie dla ciebie")
+                return
+            if ctx.guild is None:
+                await ctx.respond("to dziala tylko na serwerze")
+                return
 
-        #     if ctx.interaction:
-        #         await ctx.defer()
-        #     processed = await self._summarize_recent_messages(ctx.guild.id)
-        #     message = f"ok, zapisane {processed}" if processed > 0 else "brak nowych"
-        #     if ctx.interaction:
-        #         await ctx.send(message, ephemeral=True)
-        #     else:
-        #         await ctx.send(message)
+            author_voice = getattr(ctx.author, "voice", None)
+            if author_voice is None or author_voice.channel is None:
+                await ctx.respond("wejdz najpierw na kanal glosowy")
+                return
 
-        @self.hybrid_command(name="api", aliases=["apiinfo", "requests"], with_app_command=True)
-        async def api(ctx: commands.Context) -> None:
+            await ctx.defer()
+
+            session = self.voice_sessions.get(ctx.guild.id)
+            if session is not None and session.voice_client is not None:
+                await session.disconnect()
+
+            session = VoiceSession(self, ctx.guild, ctx.channel.id)
+            self.voice_sessions[ctx.guild.id] = session
+
+            try:
+                await session.connect(author_voice.channel)
+            except Exception as exc:
+                log.exception("nie udalo sie dolaczyc do kanalu glosowego na gildii %s", ctx.guild.id)
+                self.voice_sessions.pop(ctx.guild.id, None)
+                await ctx.respond(f"nie udalo sie dolaczyc: {type(exc).__name__}")
+                return
+
+            triggers = "/".join(self.config.voice_trigger_words)
+            message = (
+                f"jestem na {author_voice.channel.name} - Discord ma teraz obowiazkowe "
+                f"szyfrowanie E2EE (DAVE) na kanalach glosowych, ktorego py-cord jeszcze "
+                f"nie wspiera przy odbiorze dzwieku, wiec NIE sluchamy kanalu. zamiast tego: "
+                f"napisz na tym kanale \"{triggers}\" a odpowiem ci glosem"
+            )
+            await ctx.respond(message)
+
+        @self.bridge_command(name="wyjdz", aliases=["leave", "rozlacz"])
+        async def wyjdz(ctx: bridge.BridgeContext) -> None:
+            if ctx.guild is None:
+                return
+
+            session = self.voice_sessions.pop(ctx.guild.id, None)
+            if session is None or session.voice_client is None:
+                await ctx.respond("nie jestem na zadnym kanale")
+                return
+
+            await session.disconnect()
+            await ctx.respond("no to nara")
+
+        @self.bridge_command(name="api", aliases=["apiinfo", "requests"])
+        async def api(ctx: bridge.BridgeContext) -> None:
             stats = self.llm.stats
             embed = discord.Embed(title="api", color=discord.Color.dark_teal())
             embed.add_field(name="chat", value=str(stats.chat_requests), inline=True)
             embed.add_field(name="vision", value=str(stats.vision_requests), inline=True)
             embed.add_field(name="memory", value=str(stats.memory_requests), inline=True)
+            embed.add_field(name="stt", value=str(stats.stt_requests), inline=True)
+            embed.add_field(name="tts", value=str(stats.tts_requests), inline=True)
             embed.add_field(name="tool", value=str(stats.tool_calls), inline=True)
             embed.add_field(name="fail", value=str(stats.failures), inline=True)
             embed.add_field(name="tokens", value=str(stats.total_tokens), inline=True)
@@ -233,39 +290,89 @@ class CipekBot(commands.Bot):
             embed.add_field(name="total time", value=f"{stats.total_time:.3f}s", inline=True)
             embed.add_field(name="queue", value=f"{stats.queue_time:.3f}s", inline=True)
 
-            await ctx.send(embed=embed)
+            await ctx.respond(embed=embed)
 
-        # @self.hybrid_command(name="losowytest", aliases=["testping"], with_app_command=True)
-        # @commands.cooldown(1, 600, commands.BucketType.guild)
-        # @app_commands.checks.cooldown(1, 600.0, key=lambda interaction: interaction.guild_id or 0)
-        # async def losowytest(ctx: commands.Context) -> None:
-        #     if ctx.interaction:
-        #         await ctx.defer()
-        #     await self._run_random_ping(ctx.guild, ctx.channel)
-
-        # @self.hybrid_command(name="pingtest", aliases=["pinguj"], with_app_command=True)
-        # @commands.cooldown(1, 120, commands.BucketType.user)
-        # @app_commands.checks.cooldown(1, 120.0, key=lambda interaction: interaction.user.id)
-        # async def pingtest(ctx: commands.Context) -> None:
-        #     if ctx.interaction:
-        #         await ctx.defer()
-        #     await asyncio.sleep(5)
-        #     await ctx.send(f"<@{ctx.author.id}> test ping")
-
-        @self.tree.error
-        async def _on_app_command_error(
-            interaction: discord.Interaction, error: app_commands.AppCommandError
-        ) -> None:
-            if isinstance(error, app_commands.CommandOnCooldown):
-                retry_after = max(1, int(error.retry_after))
-                message = f"spokojnie, za {retry_after}s"
-                if interaction.response.is_done():
-                    await interaction.followup.send(message, ephemeral=True)
-                else:
-                    await interaction.response.send_message(message, ephemeral=True)
+        @self.bridge_command(name="eksport", aliases=["export", "backup"])
+        async def eksport(ctx: bridge.BridgeContext) -> None:
+            if ctx.author.id != self.config.admin_user_id:
+                await ctx.respond("nie dla ciebie", ephemeral=True)
                 return
 
-            raise error
+            await ctx.defer(ephemeral=True)
+
+            try:
+                zip_path = await self._build_export_zip()
+            except Exception:
+                log.exception("eksport danych nieudany")
+                await ctx.respond("eksport sie nie udal, sprawdz logi", ephemeral=True)
+                return
+
+            try:
+                size = os.path.getsize(zip_path)
+                # limit uploadu bota bez boosta serwera to zwykle 25MB, zostawiam margines
+                if size > 24 * 1024 * 1024:
+                    await ctx.respond(
+                        f"eksport gotowy ({size / 1024 / 1024:.1f}MB) ale to za duzo zeby "
+                        f"wyslac przez discorda - zabierz go recznie z kontenera: {zip_path}",
+                        ephemeral=True,
+                    )
+                    return
+
+                await ctx.respond(
+                    "twoj eksport (baza danych + logi + statystyki api)",
+                    file=discord.File(zip_path, filename=os.path.basename(zip_path)),
+                    ephemeral=True,
+                )
+            finally:
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
+
+    async def _build_export_zip(self) -> str:
+        """Pakuje do jednego zip-a: bezpieczna kopie bazy danych, wszystkie
+        pliki logow (glowny + rotowane) oraz krotki info.json ze statystykami.
+        Nigdy nie pakuje .env / tokenow / kluczy api.
+        """
+        export_dir = tempfile.mkdtemp(prefix="cipereusz-export-")
+        try:
+            db_export_path = os.path.join(export_dir, "database.sqlite3")
+            await self.memory.export_to(db_export_path)
+
+            zip_path = os.path.join(tempfile.gettempdir(), f"cipereusz-eksport-{int(time.time())}.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(db_export_path, arcname="database.sqlite3")
+
+                log_path = Path(self.config.log_file)
+                if log_path.parent.exists():
+                    for candidate in sorted(log_path.parent.glob(log_path.name + "*")):
+                        if candidate.is_file():
+                            zf.write(candidate, arcname=f"logs/{candidate.name}")
+
+                stats = self.llm.stats
+                info = {
+                    "exported_at": _now().isoformat(),
+                    "bot_user": str(self.user) if self.user else None,
+                    "guild_ids": [guild.id for guild in self.guilds],
+                    "api_stats": {
+                        "chat_requests": stats.chat_requests,
+                        "vision_requests": stats.vision_requests,
+                        "memory_requests": stats.memory_requests,
+                        "stt_requests": stats.stt_requests,
+                        "tts_requests": stats.tts_requests,
+                        "tool_calls": stats.tool_calls,
+                        "failures": stats.failures,
+                        "total_tokens": stats.total_tokens,
+                        "prompt_tokens": stats.prompt_tokens,
+                        "completion_tokens": stats.completion_tokens,
+                    },
+                }
+                zf.writestr("info.json", json.dumps(info, indent=2, ensure_ascii=False))
+
+            log.info("eksport danych gotowy: %s (%d bajtow)", zip_path, os.path.getsize(zip_path))
+            return zip_path
+        finally:
+            shutil.rmtree(export_dir, ignore_errors=True)
 
     def _register_tools(self) -> None:
         @self.tools.register(
@@ -348,22 +455,66 @@ class CipekBot(commands.Bot):
             return "ok"
 
     async def setup_hook(self) -> None:
+        # UWAGA: py-cord (w odroznieniu od discord.py 2.0+) najwyrazniej NIE
+        # wola tego hooka wcale - std. baza danych nigdy sie nie otwierala
+        # (AssertionError: self._connection is not None wszedzie). Dlatego
+        # cala inicjalizacja jest w _initialize(), wolanym idempotentnie
+        # zarowno stad (na wypadek gdyby jednak zadzialalo) jak i z on_ready
+        # (ktore na pewno sie odpali).
+        await self._initialize()
+
+    async def _initialize(self) -> None:
+        if self._initialized:
+            return
+        self._initialized = True
+
         await self.memory.open()
 
         self.idle_watchdog.start()
         self.random_ping_watchdog.start()
-        
-        await self.tree.sync()
+
+        await self.sync_commands()
 
     async def close(self) -> None:
         self.idle_watchdog.cancel()
         self.random_ping_watchdog.cancel()
 
+        for session in list(self.voice_sessions.values()):
+            try:
+                await session.disconnect()
+            except Exception:
+                log.exception("blad przy rozlaczaniu sesji glosowej podczas zamykania bota")
+        self.voice_sessions.clear()
+
         await self.memory.close()
         await super().close()
 
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if member.bot:
+            return
+
+        session = self.voice_sessions.get(member.guild.id)
+        if session is None or session.voice_client is None:
+            return
+
+        channel = getattr(session.voice_client, "channel", None)
+        if channel is None:
+            return
+
+        humans = [m for m in channel.members if not m.bot]
+        if not humans:
+            log.info("voice: kanal opustoszal, opuszczam (gildia=%s)", member.guild.id)
+            await session.disconnect()
+            self.voice_sessions.pop(member.guild.id, None)
+
     async def on_ready(self) -> None:
         print(f"logged in as {self.user}")
+        await self._initialize()
 
     async def on_message(self, message: discord.Message) -> None:
         if message.guild is not None:
@@ -379,24 +530,47 @@ class CipekBot(commands.Bot):
                 await self._reply_to_mention(message)
             return
 
+        voice_speak_session: VoiceSession | None = None
+
         if message.guild is not None:
             guild_id = message.guild.id
             self.last_activity[guild_id] = _now()
             self.recent_participants[guild_id].append((str(message.author.id), message.author.display_name))
             normalized_content = self._normalize_message_content(message)
-            self.recent_messages[guild_id].append(
-                MessageRecord(
-                    message_id=message.id,
-                    channel_id=message.channel.id,
-                    user_id=str(message.author.id),
-                    username=message.author.display_name,
-                    content=normalized_content,
-                    created_at=_now().isoformat(),
-                )
+            record = MessageRecord(
+                message_id=message.id,
+                channel_id=message.channel.id,
+                user_id=str(message.author.id),
+                username=message.author.display_name,
+                content=normalized_content,
+                created_at=_now().isoformat(),
             )
+            
+            self.recent_messages[guild_id].append(record)
+            self.pending_memory[guild_id].append(record)
+
             self.message_counter[guild_id] += 1
             if self.message_counter[guild_id] % self.config.memory_batch_size == 0:
                 asyncio.create_task(self._summarize_recent_messages(guild_id))
+
+            voice_session = self.voice_sessions.get(guild_id)
+            if (
+                voice_session is not None
+                and voice_session.voice_client is not None
+                and voice_session.channel is not None
+                and message.channel.id == voice_session.text_channel_id
+                and normalized_content
+                and contains_trigger(normalized_content, self.config.voice_trigger_words)
+            ):
+                author_voice_state = getattr(message.author, "voice", None)
+                author_channel = getattr(author_voice_state, "channel", None)
+                if author_channel is not None and author_channel.id == voice_session.channel.id:
+                    voice_speak_session = voice_session
+                else:
+                    log.info(
+                        "voice: %s napisal slowo-klucz ale nie jest na kanale glosowym, nie mowie",
+                        message.author.display_name,
+                    )
 
         if message.content and str(message.content).startswith(self.command_prefix):
             await self.process_commands(message)
@@ -409,7 +583,11 @@ class CipekBot(commands.Bot):
                 return
 
         if self.user is not None and self.user.mentioned_in(message):
-            await self._reply_to_mention(message)
+            await self._reply_to_mention(message, voice_session=voice_speak_session)
+            return
+
+        if voice_speak_session is not None:
+            await self._reply_to_mention(message, voice_session=voice_speak_session)
             return
 
         if message.guild is not None and random.random() < self.config.random_reply_chance:
@@ -427,6 +605,16 @@ class CipekBot(commands.Bot):
             return
         
         await super().on_command_error(ctx, error)
+
+    async def on_application_command_error(
+        self, ctx: discord.ApplicationContext, error: discord.DiscordException
+    ) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            retry_after = max(1, int(error.retry_after))
+            await ctx.respond(f"spokojnie, za {retry_after}s", ephemeral=True)
+            return
+
+        log.exception("blad w komendzie slash %s", getattr(ctx.command, "name", "?"), exc_info=error)
 
     async def _build_user_memory_context(self, user_id: str, discord_name: str) -> str:
         user_memory = await self.memory.get_user_memory(user_id)
@@ -450,7 +638,9 @@ class CipekBot(commands.Bot):
         
         return "\n".join(f"{record.username}: {record.content}" for record in records if record.content)
 
-    async def _reply_to_mention(self, message: discord.Message) -> None:
+    async def _reply_to_mention(
+        self, message: discord.Message, *, voice_session: "VoiceSession | None" = None
+    ) -> None:
         guild_id = message.guild.id if message.guild is not None else 0
       
         async with message.channel.typing():
@@ -500,8 +690,15 @@ class CipekBot(commands.Bot):
             return
    
         safe_reply = discord.utils.escape_mentions(reply)
+        safe_reply = _truncate_reply(safe_reply, self.config.mention_reply_limit)
    
-        await message.reply(safe_reply[: self.config.mention_reply_limit], mention_author=False)
+        await message.reply(safe_reply, mention_author=False)
+
+        # ta sama, JUZ UCIETA tresc idzie na glos - wczesniej glos mowil caly
+        # nieucinany "reply" podczas gdy na czacie leciala krotsza wersja,
+        # przez co bot mowil wiecej niz napisal
+        if voice_session is not None and voice_session.voice_client is not None:
+            asyncio.create_task(voice_session.speak(safe_reply))
 
         if not tool_context.image_used:
             await self._maybe_send_image_reply(message, guild_id, chance=self.config.image_reply_chance)
@@ -540,8 +737,9 @@ class CipekBot(commands.Bot):
             return
     
         safe_reply = discord.utils.escape_mentions(reply)
+        safe_reply = _truncate_reply(safe_reply, self.config.mention_reply_limit)
     
-        await message.reply(safe_reply[: self.config.mention_reply_limit], mention_author=False)
+        await message.reply(safe_reply, mention_author=False)
 
     async def _random_interruption(self, message: discord.Message) -> None:
         guild_id = message.guild.id if message.guild is not None else 0
@@ -783,35 +981,55 @@ class CipekBot(commands.Bot):
                 return image_bytes
         return None
 
+    def _trim_pending_memory(self, guild_id: int) -> None:
+        cap = self.config.memory_pending_cap
+        records = self.pending_memory.get(guild_id, [])
+        if len(records) > cap:
+            dropped = len(records) - cap
+            log.warning(
+                "teczka: kolejka pamieci dla gildii %s przekroczyla limit (%d), "
+                "odrzucam %d najstarszych wiadomosci",
+                guild_id, cap, dropped,
+            )
+            self.pending_memory[guild_id] = records[-cap:]
+
     async def _summarize_recent_messages(self, guild_id: int) -> int:
         if guild_id in self._summarize_inflight:
             return 0
         self._summarize_inflight.add(guild_id)
-       
+
         try:
-            last_id = int(self.last_summarized_id.get(guild_id, 0) or 0)
-            records = [record for record in self.recent_messages[guild_id] if record.message_id > last_id]
-       
-            if len(records) < 4:
+            records = list(self.pending_memory.get(guild_id, []))
+            usable = [record for record in records if record.content]
+
+            if len(usable) < 4:
                 return 0
+
             transcript = "\n".join(
                 f"user_id={record.user_id} name={record.username} text={record.content}"
-                for record in records
-                if record.content
+                for record in usable
             )
-       
-            if not transcript.strip():
-                self.last_summarized_id[guild_id] = records[-1].message_id
-                return 0
-       
+
             try:
                 payload = await self.llm.extract_memory(transcript)
             except Exception:
+                # NIE czyscimy kolejki - wiadomosci zostaja i zostana ponowione
+                # przy nastepnej partii, zamiast bezpowrotnie przepasc
+                log.warning(
+                    "teczka: ekstrakcja nieudana dla gildii %s, zachowuje %d wiadomosci do ponowienia",
+                    guild_id, len(records),
+                )
+                self._trim_pending_memory(guild_id)
                 return 0
 
-            self.last_summarized_id[guild_id] = records[-1].message_id
+            profiles_added, dirt_added = await self._apply_memory_payload(payload)
+            log.info(
+                "teczka: gildia=%s przetworzono=%d profile=%d brudy=%d",
+                guild_id, len(records), profiles_added, dirt_added,
+            )
 
-            await self._apply_memory_payload(payload)
+            # dopiero po sukcesie czyscimy przetworzona partie
+            self.pending_memory[guild_id] = []
 
             return len(records)
         finally:
@@ -1256,5 +1474,9 @@ class CipekBot(commands.Bot):
 def run_bot() -> None:
     load_dotenv()
     config = load_config()
+    setup_logging(config.log_level, config.log_file)
     bot = CipekBot(config)
+    # uwaga: py-cord (w odroznieniu od discord.py 2.4+) nie ma parametru
+    # log_handler w run()/start() - logowanie mamy juz skonfigurowane wyzej
+    # przez setup_logging(), wiec po prostu nie przekazujemy nic dodatkowego
     bot.run(config.discord_token)

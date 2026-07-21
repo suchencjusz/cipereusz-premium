@@ -138,6 +138,7 @@ class GroqService:
                     "messages": messages,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
+                    "reasoning_effort": "none",
                 }
 
                 if enable_tools:

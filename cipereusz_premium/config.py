@@ -31,6 +31,7 @@ class BotConfig:
     random_ping_max_seconds: int
     random_ping_start_hour: int
     random_ping_end_hour: int
+    random_channel_id: int
     image_reply_chance: float
     random_image_chance: float
     recent_images_max: int
@@ -65,6 +66,8 @@ def load_config() -> BotConfig:
             random_ping_end_hour,
             random_ping_start_hour,
         )
+
+    random_channel_id = int(os.getenv("RANDOM_CHANNEL_ID", "0"))
 
     image_reply_chance = float(os.getenv("IMAGE_REPLY_CHANCE", "0.15"))
     image_reply_chance = max(0.0, min(1.0, image_reply_chance))
@@ -114,6 +117,7 @@ def load_config() -> BotConfig:
         random_ping_max_seconds=random_ping_max_seconds,
         random_ping_start_hour=random_ping_start_hour,
         random_ping_end_hour=random_ping_end_hour,
+        random_channel_id=random_channel_id,
         image_reply_chance=image_reply_chance,
         random_image_chance=random_image_chance,
         recent_images_max=recent_images_max,

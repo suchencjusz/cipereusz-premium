@@ -11,19 +11,26 @@ from typing import Any
 
 from groq import AsyncGroq
 
-from .persona import BASE_PERSONA, MEMORY_EXTRACTION_PERSONA
+from .persona import BASE_PERSONA, MEMORY_EXTRACTION_PERSONA, REPORT_PERSONA
 from .tools import ToolRegistry
 
 log = logging.getLogger(__name__)
 
 
+def _strip_think(text: str) -> str:
+    """Usuwa bloki <think>...</think> z odpowiedzi modeli typu Qwen 3
+    ktore domyslnie wrzucaja swoj 'reasoning' w takich tagach."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
 def _clean_text(text: str) -> str:
+    text = _strip_think(text)
     text = text.lower().replace("_", " ")
     text = re.sub(r"[^\w\s<>@!/:.?&=%#+-]", "", text, flags=re.UNICODE)
     text = text.replace("_", " ")
     text = re.sub(r"\s+", " ", text).strip()
 
-    return text[:240]
+    return text[:500]
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -74,7 +81,7 @@ class GroqService:
         tools: ToolRegistry,
         stt_model: str = "whisper-large-v3-turbo",
     ) -> None:
-        self.client = AsyncGroq(api_key=api_key)
+        self.client = AsyncGroq(api_key=api_key, timeout=None)
         self.chat_model = chat_model
         self.vision_model = vision_model
         self.stt_model = stt_model
@@ -109,7 +116,7 @@ class GroqService:
         user_prompt: str,
         image_data_url: str | None = None,
         temperature: float = 0.8,
-        max_tokens: int = 80,
+        max_tokens: int = 160,
         tool_loop_limit: int = 4,
         enable_tools: bool = True,
     ) -> str:
@@ -139,6 +146,7 @@ class GroqService:
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                     "reasoning_effort": "none",
+                    "reasoning_format": "hidden",
                 }
 
                 if enable_tools:
@@ -233,6 +241,50 @@ class GroqService:
             max_tokens=90,
         )
 
+    async def generate_report(self, transcript: str) -> str:
+        """Generuje raport z aktywnosci serwera w stylu ASD-STE100.
+
+        Uzywa wyzszego max_tokens niz zwykle odpowiedzi (raport ma byc
+        rozbudowany) i nizszej temperatury (ma trzymac sie faktow).
+        Nie przepuszcza wyniku przez _clean_text - raport ma zachowac
+        strukture i czytelnosc.
+        """
+        user_prompt = (
+            "napisz szczegolowy raport z ponizszego logu czatu\n"
+            "rozpisz sie, podaj konkrety, cytuj wazne wypowiedzi\n\n"
+            f"{transcript}"
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": REPORT_PERSONA},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        self.stats.chat_requests += 1
+        started = time.monotonic()
+        log.info("groq report request chars=%d", len(transcript))
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.chat_model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=2500,
+                reasoning_effort="none",
+                reasoning_format="hidden",
+            )
+        except Exception as exc:
+            self.stats.failures += 1
+            log.error("blad generowania raportu: %s", exc)
+            raise
+
+        elapsed = time.monotonic() - started
+        self._accumulate_usage(getattr(response, "usage", None))
+        content = response.choices[0].message.content or ""
+        log.info("groq report done czas=%.3fs dlugosc=%d", elapsed, len(content))
+
+        return _strip_think(content)
+
     async def extract_memory(self, transcript: str) -> dict[str, Any]:
         system_prompt = MEMORY_EXTRACTION_PERSONA
 
@@ -258,6 +310,8 @@ class GroqService:
             # bylo 300 - za malo, ekstrakcja obcinala sie w polowie jsona i cala
             # partia wiadomosci przepadala bez sladu (glowna przyczyna "teczka nic nie pamieta")
             "max_tokens": 1500,
+            "reasoning_effort": "none",
+            "reasoning_format": "hidden",
         }
 
         try:
@@ -278,7 +332,7 @@ class GroqService:
 
         elapsed = time.monotonic() - started
         self._accumulate_usage(getattr(response, "usage", None))
-        raw_content = response.choices[0].message.content or "{}"
+        raw_content = _strip_think(response.choices[0].message.content or "{}")
 
         try:
             payload = _extract_json(raw_content)

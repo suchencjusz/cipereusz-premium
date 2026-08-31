@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any
+import sys
 
 import discord
 from discord.ext import bridge, commands, tasks
@@ -112,10 +113,18 @@ class CipekBot(bridge.Bot):
     def __init__(self, config: BotConfig) -> None:
         intents = discord.Intents.default()
         intents.guilds = True
+        intents.members = True
         intents.messages = True
         intents.message_content = True
 
-        super().__init__(command_prefix="!", intents=intents, help_command=None)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            help_command=None,
+            max_messages=128,
+            member_cache_flags=discord.MemberCacheFlags.none(),
+            chunk_guilds_at_startup=False,
+        )
         self.config = config
         self.memory = MemoryStore(config.database_path)
         self.tools = create_default_tools()
@@ -155,7 +164,7 @@ class CipekBot(bridge.Bot):
         @self.bridge_command(name="pomoc", aliases=["komendy", "help"])
         async def pomoc(ctx: bridge.BridgeContext) -> None:
             embed = discord.Embed(title="komendy", color=discord.Color.dark_teal())
-            embed.add_field(name="info", value="/pomoc /teczka /api /dbtest /uczsie /dolacz /wyjdz /eksport", inline=False)
+            embed.add_field(name="info", value="/pomoc /teczka /api /dbtest /uczsie /dolacz /wyjdz /eksport /raport", inline=False)
             embed.set_footer(text="dziala tez z prefiksem !")
             await ctx.respond(embed=embed)
 
@@ -328,6 +337,81 @@ class CipekBot(bridge.Bot):
                     os.remove(zip_path)
                 except OSError:
                     pass
+
+        @self.bridge_command(name="raport", aliases=["report", "summary"])
+        @commands.cooldown(1, 180, commands.BucketType.user)
+        async def raport(ctx: bridge.BridgeContext, ilosc=200) -> None:
+            """raport z kanalu (ilosc = ile wiadomosci, domyslnie 200)"""
+            if ctx.guild is None:
+                await ctx.respond("to dziala tylko na serwerze", ephemeral=True)
+                return
+
+            try:
+                ilosc = int(ilosc)
+            except (TypeError, ValueError):
+                ilosc = 200
+            ilosc = max(10, min(500, ilosc))
+            await ctx.defer()
+
+            records: list[str] = []
+            try:
+                async for msg in ctx.channel.history(limit=ilosc, oldest_first=False):
+                    if msg.author.bot:
+                        continue
+                    content = self._normalize_message_content(msg)
+                    if not content:
+                        continue
+                    ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
+                    records.append(f"[{ts}] {msg.author.display_name}: {content}")
+            except Exception:
+                log.exception("raport: blad pobierania historii kanalu")
+                await ctx.respond("nie udalo sie pobrac historii kanalu")
+                return
+
+            if not records:
+                await ctx.respond("brak wiadomosci do raportu")
+                return
+
+            # odwroc bo history(oldest_first=False) daje od najnowszych
+            records.reverse()
+            transcript = "\n".join(records)
+
+            # ogranicz dlugosc transkryptu zeby nie przekroczyc limitu kontekstu
+            if len(transcript) > 12000:
+                transcript = transcript[-12000:]
+
+            try:
+                report_text = await self.llm.generate_report(transcript)
+            except Exception:
+                log.exception("raport: blad generowania raportu")
+                await ctx.respond("nie udalo sie wygenerowac raportu")
+                return
+
+            if not report_text:
+                await ctx.respond("raport wyszedl pusty, pewnie za malo materialu")
+                return
+
+            # discord ma limit 2000 znakow na wiadomosc
+            if len(report_text) <= 1990:
+                await ctx.respond(report_text)
+            else:
+                # dziel na chunki po ~1900 znakow na granicy linii
+                chunks: list[str] = []
+                current = ""
+                for line in report_text.split("\n"):
+                    if len(current) + len(line) + 1 > 1900:
+                        chunks.append(current)
+                        current = line
+                    else:
+                        current = f"{current}\n{line}" if current else line
+                if current:
+                    chunks.append(current)
+
+                for i, chunk in enumerate(chunks):
+                    if i == 0:
+                        await ctx.respond(chunk)
+                    else:
+                        await ctx.channel.send(chunk)
 
     async def _build_export_zip(self) -> str:
         """Pakuje do jednego zip-a: bezpieczna kopie bazy danych, wszystkie
@@ -520,6 +604,7 @@ class CipekBot(bridge.Bot):
         if message.guild is not None:
             self._track_images(message)
 
+
         if message.author.bot:
             if self.user is None or message.author.id == self.user.id:
                 return
@@ -535,12 +620,18 @@ class CipekBot(bridge.Bot):
         if message.guild is not None:
             guild_id = message.guild.id
             self.last_activity[guild_id] = _now()
-            self.recent_participants[guild_id].append((str(message.author.id), message.author.display_name))
+            uid = sys.intern(str(message.author.id))
+            self.recent_participants[guild_id].append((uid, message.author.display_name))
             normalized_content = self._normalize_message_content(message)
+            # ograniczenie dlugosci contentu w rekordzie - discord pozwala 4000
+            # znakow, ale pending_memory trzyma setki rekordow; do kontekstu
+            # i ekstrakcji pamieci wystarczy 500 znakow
+            if len(normalized_content) > 500:
+                normalized_content = normalized_content[:500]
             record = MessageRecord(
                 message_id=message.id,
                 channel_id=message.channel.id,
-                user_id=str(message.author.id),
+                user_id=uid,
                 username=message.author.display_name,
                 content=normalized_content,
                 created_at=_now().isoformat(),
@@ -549,7 +640,7 @@ class CipekBot(bridge.Bot):
             self.recent_messages[guild_id].append(record)
             self.pending_memory[guild_id].append(record)
 
-            self.message_counter[guild_id] += 1
+            self.message_counter[guild_id] = (self.message_counter[guild_id] + 1) % 1_000_000
             if self.message_counter[guild_id] % self.config.memory_batch_size == 0:
                 asyncio.create_task(self._summarize_recent_messages(guild_id))
 
@@ -591,7 +682,11 @@ class CipekBot(bridge.Bot):
             return
 
         if message.guild is not None and random.random() < self.config.random_reply_chance:
-            await self._random_interruption(message)
+            # losowe wtracanie sie tylko na dedykowanym kanale
+            if self.config.random_channel_id and message.channel.id != self.config.random_channel_id:
+                pass
+            else:
+                await self._random_interruption(message)
 
         await self.process_commands(message)
 
@@ -681,7 +776,7 @@ class CipekBot(bridge.Bot):
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         temperature=0.85,
-                        max_tokens=70,
+                        max_tokens=160,
                     )
             finally:
                 self._tool_context = None
@@ -957,7 +1052,11 @@ class CipekBot(bridge.Bot):
                 continue
             if now < self.next_random_ping[guild.id]:
                 continue
-            channel = self._pick_text_channel(guild)
+            # wymuszenie dedykowanego kanalu zamiast losowego
+            if self.config.random_channel_id:
+                channel = self.get_channel(self.config.random_channel_id)
+            else:
+                channel = self._pick_text_channel(guild)
             try:
                 pinged = await self._maybe_ping_allowed_bot(guild, channel)
                 if not pinged:
@@ -1029,7 +1128,7 @@ class CipekBot(bridge.Bot):
             )
 
             # dopiero po sukcesie czyscimy przetworzona partie
-            self.pending_memory[guild_id] = []
+            self.pending_memory[guild_id].clear()
 
             return len(records)
         finally:
@@ -1050,7 +1149,11 @@ class CipekBot(bridge.Bot):
             target = self._pick_active_participant(guild.id)
             if target is None:
                 continue
-            channel = self._pick_text_channel(guild)
+            # wymuszenie dedykowanego kanalu zamiast losowego
+            if self.config.random_channel_id:
+                channel = self.get_channel(self.config.random_channel_id)
+            else:
+                channel = self._pick_text_channel(guild)
             if channel is None:
                 continue
 
@@ -1267,7 +1370,7 @@ class CipekBot(bridge.Bot):
             if self._is_image_url(candidate):
                 urls.append(candidate)
 
-        urls = list(dict.fromkeys(urls))
+        urls = list(dict.fromkeys(urls))[:150]
         if urls:
             self._kranus_cache = urls
             self._kranus_cache_time = now
